@@ -25,6 +25,11 @@ __basedir__ = os.path.expanduser('~')
 sql.register_adapter(np.int64, lambda val: int(val))
 sql.register_adapter(np.int32, lambda val: int(val))
 
+def chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
 class OpenDB(object):
     """
     Simple CM for sqlite3 databases. Commits everything at exit.
@@ -37,6 +42,12 @@ class OpenDB(object):
         self.path = path
         self._conn = None
         self._cursor = None
+
+        # TODO: add option to force update and add new items to database
+        if self.cursor.execute('SELECT COUNT(*) from gene2pubmed').fetchone()[0] == 0:
+            print('Downloading gene2pubmed. This only needs to be done once.')
+            self.load_gene2pmid()
+            self.count_gids_and_update()
 
     @property
     def conn(self):
@@ -165,16 +176,19 @@ class OpenDB(object):
 
     def fetch_pmid_info(self, pmids):
         pmids = [str(x) if not isinstance(x, str) else x for x in pmids]
-
+        import urllib
         print('Querying NCBI for abstracts')
-        with Entrez.efetch(db='pubmed', id=pmids, rettype='medline') as handle:
-            # medline is easy to parse!
-            records = list(Medline.parse(handle))  # returns a list of dictionaries
-            # time.sleep(3)
+        # cannot query more than around 200 pmids at a time!
+        pmid_info = dict()
+        for pmid_chunk in chunks(pmids, 200):
+            with Entrez.efetch(db='pubmed', id=pmid_chunk, rettype='medline') as handle:
+                # medline is easy to parse!
+                records = list(Medline.parse(handle))  # returns a list of dictionaries
+                # time.sleep(3)
+                time.sleep(.3)
+            pmid_info.update({record.get('PMID'): record for record in records})
             time.sleep(.3)
-        pmid_info = {record.get('PMID'): record for record in records}
-        time.sleep(.3)
-        # self.count_genes(pmid_info)
+            # self.count_genes(pmid_info)
         return pmid_info
 
     @staticmethod
@@ -216,24 +230,34 @@ class OpenDB(object):
         return [x for y in cursor.fetchall() for x in y]
 
     def load_gene2pmid(self):
-        #TODO: download from NCBI and update
-        #TODO: more than just human
+
+        gene2pubmed = os.path.join(os.path.split(__file__)[0], 'gene2pubmed')
+
+        if not os.path.exists(gene2pubmed):
+            ftpsource = 'ftp://ftp.ncbi.nlm.nih.gov/gene/DATA/gene2pubmed.gz'
+            import ftplib
+
+            urllib.request.urlretrieve(ftpsource, gene2pubmed+'.gz')
+
+            import gzip
+            with gzip.open(gene2pubmed+'.gz', 'rb') as f, open(gene2pubmed, 'wb') as out:
+                for line in f:
+                    out.write(line)
 
         import csv
-        gene2pubmed = os.path.join(os.path.split(__file__)[0], 'gene2pubmed')
 
         data = list()
         with open(gene2pubmed) as f:
             reader = csv.DictReader(f, delimiter='\t')
             for row in reader:
-                if row['#tax_id'] != '9606':
+                if row['#tax_id'] not in ('9606', '10090'):
                     continue
                 data.append((row['#tax_id'], row['GeneID'], row['PubMed_ID']))
 
         self.add(data)
 
     def count_gids_and_update(self):
-        self.cursor.execute
+        # self.cursor.execute
 
         df = pd.read_sql("""
         SELECT PubMedID, count(PubMedID) from gene2pubmed
@@ -279,11 +303,13 @@ class OpenDB(object):
         df = self.get_and_fetch(geneid, pmid_gene_cutoff)
 
         boolean = list()
-        regx = '|'.join(keywords)
+        # regx = '|'.join(keywords) # not this
+        bools = list()
         for col in ('title', 'abstract', 'author', 'terms'):
             df[col] = df[col].fillna('')
-            bool_res = df[col].str.contains(regx, case=case, regex=True)
-            boolean.append(bool_res)
-        boolean_frame = pd.concat(boolean, axis=1).any(1)
+            for kw in keywords:
+                bool_res = df[col].str.contains(kw, case=case, regex=True)
+                bools.append(bool_res)
+        boolean = pd.concat(bools, axis=1).any(1)
 
-        return df[boolean_frame]
+        return df[boolean]
