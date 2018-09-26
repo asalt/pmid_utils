@@ -1,7 +1,9 @@
 import os
 import sqlite3 as sql
+import csv
 import time
 import re
+import urllib
 
 import bs4
 from bs4 import BeautifulSoup
@@ -25,6 +27,19 @@ __basedir__ = os.path.expanduser('~')
 sql.register_adapter(np.int64, lambda val: int(val))
 sql.register_adapter(np.int32, lambda val: int(val))
 
+
+
+HOMOLOGENE = os.path.abspath(os.path.join(os.path.split(__file__)[0], 'homologene.tsv'))
+"""
+    1) HID (HomoloGene group id)
+    2) Taxonomy ID
+    3) Gene ID
+    4) Gene Symbol
+    5) Protein gi
+    6) Protein accession
+"""
+
+
 def chunks(l, n):
     """Yield successive n-sized chunks from l."""
     for i in range(0, len(l), n):
@@ -42,12 +57,16 @@ class OpenDB(object):
         self.path = path
         self._conn = None
         self._cursor = None
+        self.create()
 
         # TODO: add option to force update and add new items to database
         if self.cursor.execute('SELECT COUNT(*) from gene2pubmed').fetchone()[0] == 0:
             print('Downloading gene2pubmed. This only needs to be done once.')
             self.load_gene2pmid()
             self.count_gids_and_update()
+
+        if self.cursor.execute('SELECT COUNT(*) from homologene').fetchone()[0] == 0:
+            self.get_homologene()
 
     @property
     def conn(self):
@@ -105,9 +124,22 @@ class OpenDB(object):
         )
         '''
 
+        homologene_def = '''
+        CREATE TABLE IF NOT EXISTS homologene(
+        ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        HID INTEGER,
+        TaxonID INTEGER,
+        GeneID INTEGER,
+        GeneSymbol INTEGER,
+        ProteinGI INTEGER,
+        ProteinAccession TEXT
+        )
+        '''
+
         self.conn.execute(publication_def)
         self.conn.execute(gene2pubmed_def)
         self.conn.execute(pubmed_genecount)
+        self.conn.execute(homologene_def)
         self.conn.commit()
 
 
@@ -176,7 +208,6 @@ class OpenDB(object):
 
     def fetch_pmid_info(self, pmids):
         pmids = [str(x) if not isinstance(x, str) else x for x in pmids]
-        import urllib
         print('Querying NCBI for abstracts')
         # cannot query more than around 200 pmids at a time!
         pmid_info = dict()
@@ -224,7 +255,7 @@ class OpenDB(object):
 
         cursor = self.conn.execute("""SELECT gene2pubmed.PubMedID from gene2pubmed
         INNER JOIN pubmed_genecount on gene2pubmed.PubMedID = pubmed_genecount.PubMedID
-        where GeneID = ? and pubmed_genecount.GeneCount < ?
+        where GeneID = ? and pubmed_genecount.GeneCount <= ?
         """, (geneid, thresh))
 
         return [x for y in cursor.fetchall() for x in y]
@@ -244,7 +275,6 @@ class OpenDB(object):
                 for line in f:
                     out.write(line)
 
-        import csv
 
         data = list()
         with open(gene2pubmed) as f:
@@ -256,6 +286,28 @@ class OpenDB(object):
 
         self.add(data)
 
+    def get_homologene(self, path='ftp://ftp.ncbi.nih.gov/pub/HomoloGene/current/homologene.data'):
+
+        # TODO: add option to force update and add new items to database
+        if not os.path.exists(HOMOLOGENE):
+            print('Downloading homologene. This only needs to be done once.')
+            urllib.request.urlretrieve(path, HOMOLOGENE)
+
+        data = list()
+        with open(HOMOLOGENE) as f:
+            reader = csv.reader(f, delimiter='\t')
+            for row in reader:
+                data.append(row)
+
+
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO homologene(HID, TaxonID, GeneID, GeneSymbol,
+            ProteinGI, ProteinAccession)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            data
+        )
+        self.conn.commit()
+
     def count_gids_and_update(self):
         # self.cursor.execute
 
@@ -266,17 +318,25 @@ class OpenDB(object):
         df.to_sql('pubmed_genecount', self.conn, if_exists='replace', index=False)
 
 
-    def count_total(self, geneid, thresh=50):
+    def count_total(self, geneid, thresh=50, homologene=False):
 
         cursor = self.cursor.execute("""
         SELECT COUNT(DISTINCT gene2pubmed.PubMedID)
         from gene2pubmed
         inner join pubmed_genecount on gene2pubmed.PubMedID = pubmed_genecount.PubMedID
-        where GeneID = ? and pubmed_genecount.GeneCount < ?
+        where GeneID = ? and pubmed_genecount.GeneCount <= ?
         """, (geneid, thresh)
         )
 
-        return cursor.fetchall()[0][0]
+        count = cursor.fetchall()[0][0]
+
+        if homologene:
+            human_gene = self.get_hgene(geneid)
+            if human_gene and human_gene != geneid:
+                count_hgene = self.count_total(human_gene, thresh=thresh, homologene=False)
+                count += count_hgene
+
+        return count
 
     @lru_cache()
     def get_and_fetch(self, geneid, thresh):
@@ -285,7 +345,7 @@ class OpenDB(object):
         return df
 
 
-    def keyword_filter(self, geneid, keywords, case=False, pmid_gene_cutoff=50):
+    def keyword_filter(self, geneid, keywords, case=False, pmid_gene_cutoff=50, homologene=False):
 
         # if isinstance(case, int):
         #     if not case:
@@ -301,6 +361,11 @@ class OpenDB(object):
         # df = self.fetch_publications(pmids, geneid)
 
         df = self.get_and_fetch(geneid, pmid_gene_cutoff)
+        if homologene:
+            human_gene = self.get_hgene(geneid)
+            if human_gene and human_gene != geneid:
+                df2 = self.get_and_fetch(human_gene, pmid_gene_cutoff)
+                df = pd.concat((df, df2), axis=0)
 
         boolean = list()
         # regx = '|'.join(keywords) # not this
@@ -313,3 +378,27 @@ class OpenDB(object):
         boolean = pd.concat(bools, axis=1).any(1)
 
         return df[boolean]
+
+    def get_hgene(self, geneid):
+
+        cursor = self.cursor.execute("""
+                SELECT HID FROM homologene
+                where GeneID = ?
+                """, (geneid,))
+
+        res = cursor.fetchall()
+        if not res: # no homologene
+            return
+
+        HID = res[0][0]
+
+        cursor = self.cursor.execute("""
+                SELECT GeneID FROM homologene
+                where HID = ? and TaxonID = 9606
+                """, (HID,))
+        res = cursor.fetchall()
+        if not res:
+            return
+
+        geneid = res[0][0]
+        return geneid
