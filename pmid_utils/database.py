@@ -318,7 +318,7 @@ class OpenDB(object):
         df.to_sql('pubmed_genecount', self.conn, if_exists='replace', index=False)
 
 
-    def count_total(self, geneid, thresh=50, homologene=False):
+    def count_total(self, geneid, thresh=50, homologene=False, hgene_species=9606):
 
         cursor = self.cursor.execute("""
         SELECT COUNT(DISTINCT gene2pubmed.PubMedID)
@@ -331,9 +331,10 @@ class OpenDB(object):
         count = cursor.fetchall()[0][0]
 
         if homologene:
-            human_gene = self.get_hgene(geneid)
-            if human_gene and human_gene != geneid:
-                count_hgene = self.count_total(human_gene, thresh=thresh, homologene=False)
+            h_gene = self.get_hgene(geneid, species=hgene_species)
+            if h_gene and h_gene != geneid:
+                count_hgene = self.count_total(h_gene, thresh=thresh, homologene=False)
+
                 count += count_hgene
 
         return count
@@ -345,7 +346,9 @@ class OpenDB(object):
         return df
 
 
-    def keyword_filter(self, geneid, keywords, case=False, pmid_gene_cutoff=50, homologene=False):
+    def keyword_filter(self, geneid, keywords, case=False, pmid_gene_cutoff=50, homologene=False,
+                       hgene_species=9606
+    ):
 
         # if isinstance(case, int):
         #     if not case:
@@ -362,9 +365,9 @@ class OpenDB(object):
 
         df = self.get_and_fetch(geneid, pmid_gene_cutoff)
         if homologene:
-            human_gene = self.get_hgene(geneid)
-            if human_gene and human_gene != geneid:
-                df2 = self.get_and_fetch(human_gene, pmid_gene_cutoff)
+            h_gene = self.get_hgene(geneid, species=hgene_species)
+            if h_gene and h_gene != geneid:
+                df2 = self.get_and_fetch(h_gene, pmid_gene_cutoff)
                 df = pd.concat((df, df2), axis=0)
 
         boolean = list()
@@ -379,12 +382,12 @@ class OpenDB(object):
 
         return df[boolean]
 
-    def get_hgene(self, geneid):
+    def get_hgene(self, geneid, species=9606):
 
         cursor = self.cursor.execute("""
                 SELECT HID FROM homologene
                 where GeneID = ?
-                """, (geneid,))
+                """, (geneid, ))
 
         res = cursor.fetchall()
         if not res: # no homologene
@@ -394,8 +397,8 @@ class OpenDB(object):
 
         cursor = self.cursor.execute("""
                 SELECT GeneID FROM homologene
-                where HID = ? and TaxonID = 9606
-                """, (HID,))
+                where HID = ? and TaxonID = ?
+                """, (HID, species))
         res = cursor.fetchall()
         if not res:
             return
