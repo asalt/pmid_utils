@@ -347,8 +347,12 @@ class OpenDB(object):
 
 
     def keyword_filter(self, geneid, keywords, case=False, pmid_gene_cutoff=50, homologene=False,
-                       hgene_species=9606
+                       hgene_species=9606, all_matching=False
     ):
+        """
+        Filter PMIDs based on keywords
+        :all_matching: if all is required to be matching, or if one keyword matching is sufficient
+        """
 
         # if isinstance(case, int):
         #     if not case:
@@ -370,17 +374,23 @@ class OpenDB(object):
                 df2 = self.get_and_fetch(h_gene, pmid_gene_cutoff)
                 df = pd.concat((df, df2), axis=0)
 
-        boolean = list()
+        all_boolean = list()
         # regx = '|'.join(keywords) # not this
-        bools = list()
-        for col in ('title', 'abstract', 'author', 'terms'):
-            df[col] = df[col].fillna('')
-            for kw in keywords:
+        df = df.fillna('')
+        for kw in keywords:
+            bools = list()
+            for col in ('title', 'abstract', 'terms'):
                 bool_res = df[col].str.contains(kw, case=case, regex=True)
                 bools.append(bool_res)
-        boolean = pd.concat(bools, axis=1).any(1)
+            boolean = pd.concat(bools, axis=1).any(1)
+            all_boolean.append(boolean)
 
-        return df[boolean]
+        if all_matching:
+            res = pd.concat(all_boolean, axis=1).all(1)
+        elif not all_matching:
+            res = pd.concat(all_boolean, axis=1).any(1)
+
+        return df[res]
 
     def get_hgene(self, geneid, species=9606):
 
